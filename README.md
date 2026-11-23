@@ -100,6 +100,74 @@ python -m unittest discover -v
 
 ---
 
+## Academic Research Paper & Methodology
+
+CostGuard's theoretical foundations and empirical benchmarks are published in the accompanying research paper:
+
+📄 **[CostGuard Research Paper: Pre-Deployment Economic Regression Testing, Distributed OpenTelemetry Profiling, and Effective Outcome Economics for Agentic AI Workloads](docs/RESEARCH_PAPER.md)**
+
+Key contributions:
+- Mathematical derivation of **Effective Cost per Successful Outcome (ECSO)** and **Wasted Capital**.
+- Distributed parent-child OTel span hierarchy for multi-agent loops and compound AI systems.
+- Benchmark analysis of context window inflation regressions ($k=2 \rightarrow k=8$).
+- Multi-tier query caching architecture reducing dashboard response times from multi-second scans to **<15ms**.
+
+---
+
+## Cloud-Native Project Automation: Kubernetes & Red Hat OpenShift
+
+CostGuard includes enterprise-ready declarative infrastructure manifests:
+
+### A. Kubernetes Deployment
+Located in [`k8s/`](k8s/):
+- **`k8s/deployment.yaml`**: CostGuard API deployment with dual replicas, liveness/readiness probes, and PostgreSQL container.
+- **`k8s/service.yaml` & `k8s/ingress.yaml`**: ClusterIP and NGINX ingress controller configuration.
+- **`k8s/hpa.yaml`**: Horizontal Pod Autoscaler targeting 70% CPU and 80% Memory utilization.
+- **`k8s/otel-collector.yaml`**: OpenTelemetry Collector sidecar with OTLP receivers and Prometheus exporter.
+
+Deploy to any Kubernetes cluster:
+```bash
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f k8s/
+```
+
+### B. Red Hat OpenShift Deployment Automation
+Located in [`openshift/`](openshift/):
+- **`openshift/buildconfig.yaml`**: OpenShift BuildConfig with automated Git Source-to-Image (S2I) / Docker build triggers.
+- **`openshift/route.yaml`**: OpenShift Route with Edge TLS termination and automatic SSL certificate handling.
+- **`openshift/deploy.sh`**: One-command automated deployment script via the `oc` CLI.
+
+Deploy to OpenShift:
+```bash
+chmod +x openshift/deploy.sh
+./openshift/deploy.sh
+```
+
+---
+
+## OpenTelemetry Standard Integration
+
+CostGuard natively supports OpenTelemetry specifications:
+- **W3C Distributed Trace Context**: Automatically extracts and injects standard `traceparent` headers (`00-{trace_id}-{span_id}-01`) across all HTTP calls.
+- **OTel Collector Sidecar**: Configured via `otel-collector-config.yaml` to stream traces to Jaeger, SigNoz, or Prometheus.
+- **One-Click OTel JSON Export**: Available at `/api/v1/observability/otel`.
+
+---
+
+## Android Mobile Application
+
+CostGuard features a dedicated native mobile application built with **Kotlin**, **Jetpack Compose**, and **Material 3**:
+
+📱 **[CostGuard Android App Documentation](android/README.md)**
+
+Features:
+- **Real-Time Telemetry Dashboard**: Live KPI cards for P95 Latency, Streaming TTFT, Token Throughput, and ECSO.
+- **Distributed Trace Explorer**: Inspect OpenTelemetry traces and span waterfall flame bars directly on mobile.
+- **CI/CD Policy Regression Alerts**: Immediate notification feed when Pull Requests breach economic regression limits.
+- **Dynamic Endpoint Configuration**: Connect to local dev server (`10.0.2.2:8001`), Wi-Fi IP, or production OpenShift Route.
+
+---
+
 ## REST API Overview
 
 | Method | Endpoint | Description |

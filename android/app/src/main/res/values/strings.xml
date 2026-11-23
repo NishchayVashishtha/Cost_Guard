@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">CostGuard</string>
+    <string name="title_dashboard">Dashboard</string>
+    <string name="title_traces">OTel Traces</string>
+    <string name="title_alerts">Policy Alerts</string>
+    <string name="title_settings">Settings</string>
+</resources>

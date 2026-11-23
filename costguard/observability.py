@@ -198,6 +198,7 @@ class ObservabilityTracer:
         self._traces: List[Trace] = []
         self._lock = threading.Lock()
         self.max_traces = max_traces
+        self._cached_metrics: Optional[Dict[str, Any]] = None
         self._seed_demo_traces()
 
     def start_trace(self, name: str, metadata: Optional[Dict[str, Any]] = None) -> TraceContext:
@@ -216,6 +217,7 @@ class ObservabilityTracer:
             self._traces.append(trace)
             if len(self._traces) > self.max_traces:
                 self._traces.pop(0)
+            self._cached_metrics = None
 
     def list_traces(self, limit: int = 50, status: Optional[str] = None) -> List[Dict[str, Any]]:
         with self._lock:
@@ -233,8 +235,11 @@ class ObservabilityTracer:
 
     def get_metrics(self) -> Dict[str, Any]:
         with self._lock:
+            if self._cached_metrics is not None:
+                return dict(self._cached_metrics)
+
             if not self._traces:
-                return {
+                res = {
                     "total_traces": 0,
                     "total_spans": 0,
                     "mean_latency_ms": 0.0,
@@ -249,6 +254,8 @@ class ObservabilityTracer:
                     "spans_by_kind": {},
                     "total_cost_usd": 0.0,
                 }
+                self._cached_metrics = res
+                return res
 
             latencies = sorted(t.latency_ms for t in self._traces)
             total_spans = sum(len(t.spans) for t in self._traces)
@@ -300,6 +307,8 @@ class ObservabilityTracer:
                 "spans_by_kind": spans_by_kind,
                 "total_cost_usd": round(total_cost, 6),
             }
+            self._cached_metrics = res
+            return res
 
     def export_otel(self) -> Dict[str, Any]:
         """Exports traces in OpenTelemetry standard JSON format."""
@@ -308,10 +317,15 @@ class ObservabilityTracer:
             for trace in self._traces:
                 otel_spans = []
                 for s in trace.spans:
+                    # Format as 32-hex trace ID and 16-hex span ID for strict OTel spec
+                    formatted_trace_id = trace.trace_id.replace("-", "").zfill(32)[:32]
+                    formatted_span_id = s.span_id.replace("-", "").zfill(16)[:16]
+                    formatted_parent_id = s.parent_span_id.replace("-", "").zfill(16)[:16] if s.parent_span_id else ""
+
                     otel_spans.append({
-                        "traceId": trace.trace_id,
-                        "spanId": s.span_id,
-                        "parentSpanId": s.parent_span_id or "",
+                        "traceId": formatted_trace_id,
+                        "spanId": formatted_span_id,
+                        "parentSpanId": formatted_parent_id,
                         "name": s.name,
                         "kind": s.kind.upper(),
                         "startTimeUnixNano": int(s.start_time * 1e9),
@@ -332,6 +346,20 @@ class ObservabilityTracer:
                     "scopeSpans": [{"spans": otel_spans}],
                 })
             return {"resourceSpans": resource_spans}
+
+    def export_to_otlp(self, endpoint: Optional[str] = None) -> bool:
+        """Forward current traces to an OpenTelemetry Collector via OTLP/HTTP."""
+        target_endpoint = endpoint or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+        if not target_endpoint:
+            return False
+        try:
+            import httpx
+            payload = self.export_otel()
+            with httpx.Client(timeout=3.0) as client:
+                res = client.post(target_endpoint, json=payload, headers={"Content-Type": "application/json"})
+                return res.status_code in (200, 202)
+        except Exception:
+            return False
 
     def _seed_demo_traces(self):
         """Seed representative traces so UI and telemetry are functional immediately."""
@@ -466,3 +494,23 @@ class ObservabilityTracer:
 
 # Global singleton tracer
 tracer = ObservabilityTracer()
+
+
+def extract_w3c_trace_context(headers: Dict[str, str]) -> tuple[Optional[str], Optional[str]]:
+    """Extract trace_id and parent_span_id from standard W3C 'traceparent' header.
+    Format: 00-{trace_id}-{parent_id}-{flags}
+    """
+    traceparent = headers.get("traceparent") or headers.get("Traceparent")
+    if not traceparent:
+        return None, None
+    parts = traceparent.split("-")
+    if len(parts) >= 4 and parts[0] == "00":
+        return parts[1], parts[2]
+    return None, None
+
+
+def inject_w3c_trace_context(trace_id: str, span_id: str) -> Dict[str, str]:
+    """Generate standard W3C 'traceparent' header for distributed context propagation."""
+    clean_trace = trace_id.replace("-", "").zfill(32)[:32]
+    clean_span = span_id.replace("-", "").zfill(16)[:16]
+    return {"traceparent": f"00-{clean_trace}-{clean_span}-01"}

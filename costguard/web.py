@@ -50,10 +50,11 @@ def _demo_data():
 @router.get("/", response_class=HTMLResponse)
 def dashboard(request: Request):
     try:
-        jobs = db.list_jobs()[:8]
-        reports = db.list_comparisons()[:8]
-        artifacts = db.list_artifacts()[:8]
-        investigations = db.list_investigations()[:8]
+        summary = db.get_dashboard_summary(limit=8)
+        jobs = summary.get("jobs", [])
+        reports = summary.get("reports", [])
+        artifacts = summary.get("artifacts", [])
+        investigations = summary.get("investigations", [])
     except Exception:
         jobs, reports, artifacts, investigations = [], [], [], []
 
@@ -98,9 +99,9 @@ def observability_page(request: Request):
 @router.get("/investigations", response_class=HTMLResponse)
 def investigations_page(request: Request, report_id: str | None = None):
     try:
-        reports = db.list_comparisons()
+        reports = db.list_comparisons(limit=30)
         analyst = db.get_analyst_settings()
-        investigations = db.list_investigations()
+        investigations = db.list_investigations(limit=30)
     except Exception:
         reports, analyst, investigations = [], None, []
     if not reports:
@@ -173,7 +174,7 @@ def investigation_page(request: Request, investigation_id: str):
 def experiments(request: Request):
     example = (root / "examples" / "experiment_baseline.json").read_text()
     try:
-        jobs = db.list_jobs()[:20]
+        jobs = db.list_jobs(limit=25)
         suites = db.list_suites()
     except Exception:
         jobs, suites = [], []
@@ -198,8 +199,8 @@ def job_page(request: Request, job_id: str):
 def reports(request: Request):
     example = json.loads((root / "examples" / "experiment_baseline.json").read_text())
     try:
-        artifacts = db.list_artifacts()
-        reps = db.list_comparisons()
+        artifacts = db.list_artifacts(limit=30)
+        reps = db.list_comparisons(limit=30)
     except Exception:
         artifacts, reps = [], []
     if not reps:
@@ -245,7 +246,7 @@ def artifact_page(request: Request, artifact_id: str):
 def scenarios(request: Request):
     example = json.loads((root / "examples" / "experiment_baseline.json").read_text())
     try:
-        artifacts = db.list_artifacts()
+        artifacts = db.list_artifacts(limit=30)
     except Exception:
         d_arts, _, _, _, _ = _demo_data()
         artifacts = d_arts

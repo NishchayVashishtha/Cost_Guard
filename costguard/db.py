@@ -3,13 +3,14 @@
 import hashlib
 import json
 import os
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engine, select, text
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, load_only, mapped_column
 
 from .execution import ExecutionArtifact, ExperimentSpec
 
@@ -21,7 +22,56 @@ def database_url() -> str:
     )
 
 
-engine = create_engine(database_url(), pool_pre_ping=True)
+def _init_engine(url: str):
+    connect_args = {}
+    if "postgresql" in url or "psycopg" in url:
+        connect_args = {"connect_timeout": 2}
+    return create_engine(url, pool_pre_ping=True, connect_args=connect_args)
+
+
+engine = _init_engine(database_url())
+
+# High-speed in-memory query cache & DB circuit-breaker
+_query_cache: dict[str, tuple[float, any]] = {}
+_CACHE_TTL_SECONDS: float = 3.0
+_last_db_check: float = 0.0
+_is_db_online: bool = True
+_DB_RECHECK_INTERVAL: float = 5.0
+
+
+def get_cached(key: str):
+    item = _query_cache.get(key)
+    if item:
+        ts, val = item
+        if time.time() - ts < _CACHE_TTL_SECONDS:
+            return val
+        _query_cache.pop(key, None)
+    return None
+
+
+def set_cached(key: str, val: any):
+    _query_cache[key] = (time.time(), val)
+
+
+def invalidate_query_cache():
+    _query_cache.clear()
+
+
+def is_db_online() -> bool:
+    global _last_db_check, _is_db_online
+    now = time.time()
+    if not _is_db_online and (now - _last_db_check) < _DB_RECHECK_INTERVAL:
+        return False
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        _is_db_online = True
+        _last_db_check = now
+        return True
+    except Exception:
+        _is_db_online = False
+        _last_db_check = now
+        return False
 
 
 class Base(DeclarativeBase):
@@ -35,7 +85,7 @@ class ArtifactRow(Base):
     name: Mapped[str] = mapped_column(String(200))
     digest: Mapped[str] = mapped_column(String(64))
     payload: Mapped[dict] = mapped_column(JSONB)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
 
 
 class SuiteRow(Base):
@@ -57,7 +107,7 @@ class ComparisonRow(Base):
     candidate_id: Mapped[str] = mapped_column(String(36), ForeignKey("artifacts.id"))
     request_payload: Mapped[dict] = mapped_column(JSONB)
     report: Mapped[dict] = mapped_column(JSONB)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
 
 
 class JobRow(Base):
@@ -70,7 +120,7 @@ class JobRow(Base):
     artifact_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("artifacts.id"), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
 
 
 class SettingRow(Base):
@@ -90,20 +140,20 @@ class InvestigationRow(Base):
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     proposal_job_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("jobs.id"), nullable=True)
     proposal_report_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("comparisons.id"), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
 
 
 @contextmanager
 def session_scope():
+    if not is_db_online():
+        raise RuntimeError("Database connection is currently unavailable")
     with Session(engine) as session:
         with session.begin():
             yield session
 
 
 def ready() -> bool:
-    with engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
-    return True
+    return is_db_online()
 
 
 def _json(model) -> dict:
@@ -128,6 +178,7 @@ def import_artifact(artifact: ExecutionArtifact) -> tuple[str, bool]:
             digest=digest,
             payload=payload,
         ))
+    invalidate_query_cache()
     return artifact_id, True
 
 
@@ -137,10 +188,23 @@ def get_artifact(artifact_id: str) -> ExecutionArtifact | None:
         return ExecutionArtifact.model_validate(row.payload) if row else None
 
 
-def list_artifacts() -> list[dict]:
+def list_artifacts(limit: int = 50) -> list[dict]:
+    cache_key = f"artifacts_{limit}"
+    cached = get_cached(cache_key)
+    if cached is not None:
+        return cached
+
     with session_scope() as session:
-        rows = session.scalars(select(ArtifactRow).order_by(ArtifactRow.created_at.desc())).all()
-        return [{"id": r.id, "suite_id": r.suite_id, "name": r.name, "created_at": r.created_at.isoformat()} for r in rows]
+        stmt = (
+            select(ArtifactRow)
+            .options(load_only(ArtifactRow.id, ArtifactRow.suite_id, ArtifactRow.name, ArtifactRow.created_at))
+            .order_by(ArtifactRow.created_at.desc())
+            .limit(limit)
+        )
+        rows = session.scalars(stmt).all()
+        res = [{"id": r.id, "suite_id": r.suite_id, "name": r.name, "created_at": r.created_at.isoformat()} for r in rows]
+        set_cached(cache_key, res)
+        return res
 
 
 def save_suite(spec: ExperimentSpec) -> str:
@@ -150,6 +214,7 @@ def save_suite(spec: ExperimentSpec) -> str:
             session.add(SuiteRow(id=spec.suite_id, payload=_json(spec)))
         else:
             row.payload = _json(spec)
+    invalidate_query_cache()
     return spec.suite_id
 
 
@@ -160,9 +225,16 @@ def get_suite(suite_id: str) -> ExperimentSpec | None:
 
 
 def list_suites() -> list[dict]:
+    cache_key = "suites_list"
+    cached = get_cached(cache_key)
+    if cached is not None:
+        return cached
+
     with session_scope() as session:
         rows = session.scalars(select(SuiteRow).order_by(SuiteRow.id)).all()
-        return [{"suite_id": r.id, "name": r.payload.get("name", r.id)} for r in rows]
+        res = [{"suite_id": r.id, "name": r.payload.get("name", r.id)} for r in rows]
+        set_cached(cache_key, res)
+        return res
 
 
 def set_baseline(suite_id: str, artifact_id: str) -> None:
@@ -175,6 +247,7 @@ def set_baseline(suite_id: str, artifact_id: str) -> None:
             session.add(BaselineRow(suite_id=suite_id, artifact_id=artifact_id))
         else:
             row.artifact_id = artifact_id
+    invalidate_query_cache()
 
 
 def get_baseline(suite_id: str) -> str | None:
@@ -193,6 +266,7 @@ def save_comparison(baseline_id: str, candidate_id: str, request: dict, report: 
             request_payload=request,
             report=report,
         ))
+    invalidate_query_cache()
     return report_id
 
 
@@ -202,17 +276,31 @@ def get_comparison(report_id: str) -> dict | None:
         return {"id": row.id, "request": row.request_payload, "report": row.report} if row else None
 
 
-def list_comparisons() -> list[dict]:
+def list_comparisons(limit: int = 50) -> list[dict]:
+    cache_key = f"comparisons_{limit}"
+    cached = get_cached(cache_key)
+    if cached is not None:
+        return cached
+
     with session_scope() as session:
-        rows = session.scalars(select(ComparisonRow).order_by(ComparisonRow.created_at.desc())).all()
-        return [{"id": r.id, "baseline_id": r.baseline_id, "candidate_id": r.candidate_id,
-                 "status": r.report.get("status"), "created_at": r.created_at.isoformat()} for r in rows]
+        stmt = (
+            select(ComparisonRow)
+            .options(load_only(ComparisonRow.id, ComparisonRow.baseline_id, ComparisonRow.candidate_id, ComparisonRow.report, ComparisonRow.created_at))
+            .order_by(ComparisonRow.created_at.desc())
+            .limit(limit)
+        )
+        rows = session.scalars(stmt).all()
+        res = [{"id": r.id, "baseline_id": r.baseline_id, "candidate_id": r.candidate_id,
+                 "status": (r.report or {}).get("status"), "created_at": r.created_at.isoformat()} for r in rows]
+        set_cached(cache_key, res)
+        return res
 
 
 def create_job(spec: ExperimentSpec) -> str:
     job_id = str(uuid4())
     with session_scope() as session:
         session.add(JobRow(id=job_id, state="queued", spec=_json(spec), total=len(spec.cases)))
+    invalidate_query_cache()
     return job_id
 
 
@@ -227,10 +315,23 @@ def _job_view(row: JobRow) -> dict:
             "artifact_id": row.artifact_id, "error": row.error}
 
 
-def list_jobs() -> list[dict]:
+def list_jobs(limit: int = 50) -> list[dict]:
+    cache_key = f"jobs_{limit}"
+    cached = get_cached(cache_key)
+    if cached is not None:
+        return cached
+
     with session_scope() as session:
-        rows = session.scalars(select(JobRow).order_by(JobRow.created_at.desc())).all()
-        return [_job_view(row) for row in rows]
+        stmt = (
+            select(JobRow)
+            .options(load_only(JobRow.id, JobRow.state, JobRow.progress, JobRow.total, JobRow.artifact_id, JobRow.error, JobRow.created_at))
+            .order_by(JobRow.created_at.desc())
+            .limit(limit)
+        )
+        rows = session.scalars(stmt).all()
+        res = [_job_view(row) for row in rows]
+        set_cached(cache_key, res)
+        return res
 
 
 def claim_job() -> tuple[str, ExperimentSpec] | None:
@@ -267,6 +368,7 @@ def update_job(job_id: str, *, progress: int | None = None, state: str | None = 
             row.error = error
         if row.state == "running":
             row.lease_until = datetime.now(timezone.utc) + timedelta(seconds=60)
+    invalidate_query_cache()
 
 
 def cancel_job(job_id: str) -> bool:
@@ -275,7 +377,8 @@ def cancel_job(job_id: str) -> bool:
         if row is None or row.state not in {"queued", "running"}:
             return False
         row.state = "cancelled"
-        return True
+    invalidate_query_cache()
+    return True
 
 
 def get_analyst_settings() -> dict | None:
@@ -291,6 +394,7 @@ def save_analyst_settings(settings) -> None:
             session.add(SettingRow(id="analyst", payload=_json(settings)))
         else:
             row.payload = _json(settings)
+    invalidate_query_cache()
 
 
 def source_experiment(artifact_id: str) -> ExperimentSpec | None:
@@ -308,6 +412,7 @@ def create_investigation(report_id: str, question: str, analyst, source=None) ->
             request={"question": question, "analyst": _json(analyst),
                      "source_spec": _json(source) if source else None},
         ))
+    invalidate_query_cache()
     return investigation_id
 
 
@@ -324,12 +429,42 @@ def get_investigation(investigation_id: str) -> dict | None:
         return _investigation_view(row) if row else None
 
 
-def list_investigations() -> list[dict]:
+def list_investigations(limit: int = 50) -> list[dict]:
+    cache_key = f"investigations_{limit}"
+    cached = get_cached(cache_key)
+    if cached is not None:
+        return cached
+
     with session_scope() as session:
-        rows = session.scalars(select(InvestigationRow).order_by(InvestigationRow.created_at.desc()).limit(100)).all()
-        return [{"id": row.id, "report_id": row.report_id, "state": row.state,
-                 "question": row.request["question"], "created_at": row.created_at.isoformat()}
+        stmt = (
+            select(InvestigationRow)
+            .options(load_only(InvestigationRow.id, InvestigationRow.report_id, InvestigationRow.state, InvestigationRow.request, InvestigationRow.created_at))
+            .order_by(InvestigationRow.created_at.desc())
+            .limit(limit)
+        )
+        rows = session.scalars(stmt).all()
+        res = [{"id": row.id, "report_id": row.report_id, "state": row.state,
+                 "question": (row.request or {}).get("question", "Investigation"), "created_at": row.created_at.isoformat()}
                 for row in rows]
+        set_cached(cache_key, res)
+        return res
+
+
+def get_dashboard_summary(limit: int = 8) -> dict:
+    """Optimized batch query for dashboard KPIs and cards with instant TTL cache."""
+    cache_key = f"dashboard_summary_{limit}"
+    cached = get_cached(cache_key)
+    if cached is not None:
+        return cached
+
+    summary = {
+        "jobs": list_jobs(limit=limit),
+        "reports": list_comparisons(limit=limit),
+        "artifacts": list_artifacts(limit=limit),
+        "investigations": list_investigations(limit=limit),
+    }
+    set_cached(cache_key, summary)
+    return summary
 
 
 def claim_investigation() -> str | None:
@@ -361,6 +496,7 @@ def update_investigation(investigation_id: str, *, result=None, state=None, erro
                 row.state = state
             row.error = error
             row.lease_until = datetime.now(timezone.utc) + timedelta(seconds=180)
+    invalidate_query_cache()
 
 
 def cancel_investigation(investigation_id: str) -> bool:
@@ -369,7 +505,8 @@ def cancel_investigation(investigation_id: str) -> bool:
         if row is None or row.state not in {"queued", "running"}:
             return False
         row.state = "cancelled"
-        return True
+    invalidate_query_cache()
+    return True
 
 
 def run_investigation_proposal(investigation_id: str) -> str:
@@ -387,6 +524,7 @@ def run_investigation_proposal(investigation_id: str) -> str:
         session.add(JobRow(id=job_id, state="queued", spec=_json(spec), total=len(spec.cases)))
         session.flush()
         row.proposal_job_id = job_id
+        invalidate_query_cache()
         return job_id
 
 
@@ -416,4 +554,5 @@ def compare_investigation_proposal(investigation_id: str) -> str:
             candidate_id=job.artifact_id, request_payload=request, report=_json(report)))
         session.flush()
         row.proposal_report_id = report_id
+        invalidate_query_cache()
         return report_id

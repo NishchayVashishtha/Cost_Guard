@@ -37,3 +37,10 @@ coverage.xml
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Android and Gradle build artifacts
+.gradle/
+android/.gradle/
+android/app/build/
+*.apk
+*.aab

@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: costguard-config
+  namespace: costguard
+  labels:
+    app: costguard
+data:
+  APP_ENV: "production"
+  PORT: "8000"
+  DATABASE_URL: "postgresql+psycopg://costguard:costguard@postgres.costguard.svc.cluster.local:5432/costguard"
+  OTEL_SERVICE_NAME: "costguard-enterprise"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.costguard.svc.cluster.local:4318/v1/traces"
+  COSTGUARD_DEMO: "0"

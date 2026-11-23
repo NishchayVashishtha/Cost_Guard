@@ -1,0 +1,43 @@
+apiVersion: project.openshift.io/v1
+kind: Project
+metadata:
+  name: costguard-devops
+  annotations:
+    openshift.io/description: "CostGuard AI DevOps & Economic Intelligence Platform"
+    openshift.io/display-name: "CostGuard AI DevOps"
+---
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: costguard
+  namespace: costguard-devops
+spec:
+  lookupPolicy:
+    local: true
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: costguard-build
+  namespace: costguard-devops
+  labels:
+    app: costguard
+spec:
+  source:
+    type: Git
+    git:
+      uri: "https://github.com/NishchayVashishtha/CostGuard.git"
+      ref: "main"
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: Dockerfile
+  output:
+    to:
+      kind: ImageStreamTag
+      name: "costguard:latest"
+  triggers:
+    - type: ConfigChange
+    - type: GitHub
+      github:
+        secret: "costguard-webhook-secret"
